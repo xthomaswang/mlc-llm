@@ -10,7 +10,6 @@ from tvm import te, tir
 from tvm.relax.frontend import nn
 from tvm.relax.frontend.nn import Tensor, op
 
-from mlc_llm import op as op_ext
 from mlc_llm.support import logging
 from mlc_llm.support.config import ConfigBase
 from mlc_llm.support.style import bold
@@ -108,8 +107,25 @@ class BertSelfAttention(nn.Module):  # pylint: disable=too-many-instance-attribu
         qkv = op.reshape(qkv, (b, s, 3 * h, d))
         q, k, v = op.split(qkv, 3, axis=2)
 
-        # Attention
-        output = op_ext.attention(q, k, v, attention_mask)
+        # Encoder masked attention using standard nn ops.
+        # The generic attention fallback path dropped the mask (correctness bug).
+        # q, k, v: [b, s, h, d], attention_mask: [b, 1, s, s] (additive, min_value for masked)
+        q = op.permute_dims(q, [0, 2, 1, 3])  # [b, h, s, d]
+        k = op.permute_dims(k, [0, 2, 1, 3])  # [b, h, s, d]
+        v = op.permute_dims(v, [0, 2, 1, 3])  # [b, h, s, d]
+
+        scale = 1.0 / (d**0.5)
+        # attn_weights: [b, h, s, s]
+        attn_weights = op.matmul(q, op.permute_dims(k, [0, 1, 3, 2])) * scale
+        # Apply additive mask: masked positions have min_value → softmax → ~0
+        attn_weights = attn_weights + attention_mask
+        attn_weights = op.softmax(attn_weights, axis=-1)
+
+        # attn_output: [b, h, s, d]
+        attn_output = op.matmul(attn_weights, v)
+        # [b, h, s, d] -> [b, s, h, d] -> [b, s, h*d]
+        attn_output = op.permute_dims(attn_output, [0, 2, 1, 3])
+        output = op.reshape(attn_output, (b, s, h * d))
         return output
 
 
@@ -244,12 +260,14 @@ class BertModel(nn.Module):
 
     def prefill(self, inputs: Tensor, attention_mask: Tensor):
         def _attention_mask(mask: te.Tensor, zero, batch_size, seq_len):
+            # Additive attention mask: 0 for real tokens, min_value for padding.
+            # Added to attention scores before softmax so padding → -inf → softmax → 0.
             return te.compute(
                 (batch_size, 1, seq_len, seq_len),
                 lambda b, _, i, j: tir.if_then_else(
                     tir.any(mask[b, i] == zero, mask[b, j] == zero),
                     tir.min_value(self.dtype),
-                    tir.max_value(self.dtype),
+                    tir.const(0, self.dtype),
                 ),
                 name="attention_mask_prefill",
             )

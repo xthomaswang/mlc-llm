@@ -198,7 +198,7 @@ def _compile(args: CompileArgs, model_config: ConfigBase):
         # TODO: Remove this workaround when the TVM CSE regression is fixed.
         # Temporary workaround for TVM CSE regression that can produce
         # dangling `cse_v*` vars during host codegen.
-        pass_config["tir.disable_cse_tir"] = True
+        pass_config["tirx.disable_cse_tir"] = True
 
         with PassContext(config=pass_config):
             args.build_func(

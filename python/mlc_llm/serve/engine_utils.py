@@ -1,7 +1,7 @@
 """Utility functions for MLC Serve engine"""
 
 import uuid
-from typing import Any, Callable, Dict, List, Literal, Optional, Union  # noqa: UP035
+from typing import Any, Callable, Dict, List, Optional, Union  # noqa: UP035
 
 from mlc_llm.protocol import error_protocol, openai_api_protocol
 from mlc_llm.protocol.generation_config import GenerationConfig

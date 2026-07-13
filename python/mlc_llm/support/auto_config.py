@@ -68,16 +68,22 @@ def detect_mlc_chat_config(mlc_chat_config: str) -> Path:
     return mlc_chat_config_json_path
 
 
+def detect_model_task_and_config(model: str) -> tuple[str, Path]:
+    """Detect a model task and return its resolved ``mlc-chat-config.json`` path."""
+    config_path = detect_mlc_chat_config(model)
+    with open(config_path, encoding="utf-8") as f:
+        cfg = json.load(f)
+    return cfg.get("model_task", "chat"), config_path
+
+
 def detect_model_task(model: str) -> str:
     """Detect the ``model_task`` field from a model's ``mlc-chat-config.json``.
 
     Returns ``"chat"`` or ``"embedding"``.  Defaults to ``"chat"`` when the
     field is absent.
     """
-    config_path = detect_mlc_chat_config(model)
-    with open(config_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    return cfg.get("model_task", "chat")
+    model_task, _ = detect_model_task_and_config(model)
+    return model_task
 
 
 def detect_config(config: str) -> Path:

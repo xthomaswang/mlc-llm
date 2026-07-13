@@ -239,9 +239,7 @@ async def request_completion(request: CompletionRequest, raw_request: fastapi.Re
 
 
 @chat_completions_router.post("/v1/chat/completions")
-async def request_chat_completion(
-    request: ChatCompletionRequest, raw_request: fastapi.Request
-):
+async def request_chat_completion(request: ChatCompletionRequest, raw_request: fastapi.Request):
     """OpenAI-compatible chat completion API.
     API reference: https://platform.openai.com/docs/api-reference/chat
     """

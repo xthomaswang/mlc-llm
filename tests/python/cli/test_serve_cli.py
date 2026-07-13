@@ -1,6 +1,6 @@
-"""Unit tests for mlc_llm.cli.serve – single-task serve CLI validation.
+"""Unit tests for mlc_llm.cli.serve - single-task serve CLI validation.
 
-No module-level import of mlc_llm — everything is loaded via the ``serve_mod``
+No module-level import of mlc_llm - everything is loaded via the ``serve_mod``
 fixture.  When tvm is unavailable, the fixture installs minimal stubs scoped
 to this module's lifetime and removes them on teardown, so other test files
 in the same pytest session are never affected.
@@ -13,6 +13,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+pytestmark = [pytest.mark.unittest]
 
 # ---------------------------------------------------------------------------
 # Stub lists (only used when tvm is absent)
@@ -59,7 +61,7 @@ def serve_mod():
     installed: dict = {}  # name → previous sys.modules value or _MISSING
 
     try:
-        import mlc_llm.cli.serve as mod  # noqa: F811
+        import mlc_llm.cli.serve as mod
 
         yield mod
         return  # no stubs, nothing to clean up
@@ -68,7 +70,7 @@ def serve_mod():
 
     # --- tvm unavailable: install stubs ---
     tvm_stub = types.ModuleType("tvm")
-    tvm_stub.register_global_func = lambda *a, **kw: (lambda fn: fn)
+    tvm_stub.register_global_func = lambda *a, **kw: lambda fn: fn
 
     for name in _TVM_NAMES:
         installed[name] = sys.modules.get(name, _MISSING)
@@ -79,7 +81,7 @@ def serve_mod():
     if "mlc_llm.libinfo" in sys.modules:
         sys.modules["mlc_llm.libinfo"].__version__ = "0.0.0-test"
 
-    import mlc_llm.cli.serve as mod  # noqa: F811
+    import mlc_llm.cli.serve as mod
 
     yield mod
 
@@ -238,7 +240,7 @@ class TestEmbeddingForbiddenOptions:
         ],
     )
     def test_forbidden_option_rejected(self, serve_mod, embedding_model_dir, extra_argv):
-        argv = [embedding_model_dir, "--model-lib", "/fake/lib.so"] + extra_argv
+        argv = [embedding_model_dir, "--model-lib", "/fake/lib.so", *extra_argv]
         with patch("mlc_llm.cli.serve._detect_model_task", return_value="embedding"):
             with pytest.raises(SystemExit) as exc_info:
                 serve_mod.main(argv)

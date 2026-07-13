@@ -16,6 +16,8 @@ Environment variables:
 
 import asyncio
 import os
+from importlib.util import find_spec
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -335,14 +337,17 @@ def test_unicode_text(embedding_engine):
 # Unit tests — no real model required
 # ===================================================================
 
-from unittest import mock
-
-try:
+if find_spec("tvm") is not None:
     from mlc_llm.serve import engine_utils
-    from mlc_llm.serve.embedding_engine import AsyncEmbeddingEngine, EmbeddingRuntime
+    from mlc_llm.serve.embedding_engine import (
+        AsyncEmbeddingEngine,
+        EmbeddingRuntime,
+        TVMNativeEmbeddingRuntime,
+        _canonicalize_decoder_inputs,
+    )
 
     _HAS_UNIT_DEPS = isinstance(EmbeddingRuntime, type) and isinstance(AsyncEmbeddingEngine, type)
-except ImportError:
+else:
     _HAS_UNIT_DEPS = False
 
 _skip_no_tvm = pytest.mark.skipif(not _HAS_UNIT_DEPS, reason="tvm not installed")
@@ -435,6 +440,15 @@ def test_unit_engine_delegates_embed():
     assert result == ([[0.5, 0.5, 0.5, 0.5]] * 2, 3)
     assert rt.embed_calls == [["hello world", "foo"]]
     eng.terminate()
+
+
+@_skip_no_tvm
+def test_unit_native_runtime_empty_input_is_a_noop():
+    """Both embedding lanes return an empty result for an empty direct call."""
+    runtime = object.__new__(TVMNativeEmbeddingRuntime)
+    runtime._model_type = "decoder"
+
+    assert runtime.embed([]) == ([], 0)
 
 
 @_skip_no_tvm
@@ -559,6 +573,124 @@ def test_unit_runtime_rejects_incomplete_metadata(monkeypatch):
     _patch_tvm_deps(monkeypatch, raw_meta)
 
     with pytest.raises(ValueError, match="Embedding metadata is missing or incomplete"):
+        TVMNativeEmbeddingRuntime("fake_model", "fake_lib.so", device="cpu")
+
+
+@_skip_no_tvm
+def test_unit_decoder_truncation_preserves_manual_eos():
+    """Decoder truncation keeps the EOS position used by last-token pooling."""
+    tokenizer = mock.MagicMock()
+    tokenizer.encode.return_value = list(range(10))
+
+    token_lists = _canonicalize_decoder_inputs(
+        ["long input"],
+        tokenizer,
+        tokenizer_appends_eos=False,
+        eos_token_id=99,
+        max_seq_len=4,
+    )
+
+    assert token_lists == [[0, 1, 2, 99]]
+
+
+@_skip_no_tvm
+def test_unit_decoder_truncation_preserves_tokenizer_terminal_token():
+    """A tokenizer-provided terminal token is preserved even without EOS metadata."""
+    tokenizer = mock.MagicMock()
+    tokenizer.encode.return_value = [10, 11, 77]
+
+    token_lists = _canonicalize_decoder_inputs(
+        ["input"],
+        tokenizer,
+        tokenizer_appends_eos=True,
+        eos_token_id=None,
+        max_seq_len=2,
+    )
+
+    assert token_lists == [[10, 77]]
+
+
+@_skip_no_tvm
+def test_unit_decoder_rejects_zero_token_input():
+    """A zero-token decoder input fails instead of silently dropping a response."""
+    tokenizer = mock.MagicMock()
+    tokenizer.encode.return_value = []
+
+    with pytest.raises(ValueError, match="tokenized to 0 tokens"):
+        _canonicalize_decoder_inputs(
+            [""],
+            tokenizer,
+            tokenizer_appends_eos=False,
+            eos_token_id=None,
+            max_seq_len=8,
+        )
+
+
+@_skip_no_tvm
+def test_unit_sub_batching_rejects_empty_token_list():
+    """Sub-batching never changes response count by skipping an empty item."""
+    with pytest.raises(ValueError, match="must not be empty"):
+        TVMNativeEmbeddingRuntime._build_sub_batches([[1], [], [2]], prefill_chunk=4)
+
+
+@pytest.mark.parametrize(
+    ("embedding_metadata", "message"),
+    [
+        (
+            {"model_type": "unknown", "pooling_strategy": "last", "normalize": True},
+            "model_type must be",
+        ),
+        (
+            {"model_type": "encoder", "pooling_strategy": "invalid", "normalize": True},
+            "pooling_strategy must be",
+        ),
+        (
+            {"model_type": "decoder", "pooling_strategy": "mean", "normalize": True},
+            "requires pooling_strategy='last'",
+        ),
+        (
+            {"model_type": "encoder", "pooling_strategy": "cls", "normalize": "yes"},
+            "normalize must be a boolean",
+        ),
+    ],
+)
+@_skip_no_tvm
+def test_unit_runtime_rejects_invalid_metadata(monkeypatch, embedding_metadata, message):
+    """Embedding metadata values are validated before lane initialization."""
+    raw_meta = {
+        "model_task": "embedding",
+        "embedding_metadata": embedding_metadata,
+        "params": [],
+    }
+    _patch_tvm_deps(monkeypatch, raw_meta)
+
+    with pytest.raises(ValueError, match=message):
+        TVMNativeEmbeddingRuntime("fake_model", "fake_lib.so", device="cpu")
+
+
+@pytest.mark.parametrize(
+    ("parallel_field", "parallel_value"),
+    [
+        ("tensor_parallel_shards", 2),
+        ("pipeline_parallel_stages", 2),
+    ],
+)
+@_skip_no_tvm
+def test_unit_runtime_rejects_distributed_artifact(monkeypatch, parallel_field, parallel_value):
+    """The single-device runtime rejects artifacts that require Disco."""
+    raw_meta = {
+        "model_task": "embedding",
+        "embedding_metadata": {
+            "model_type": "decoder",
+            "pooling_strategy": "last",
+            "normalize": True,
+        },
+        "params": [],
+        parallel_field: parallel_value,
+    }
+    _patch_tvm_deps(monkeypatch, raw_meta)
+
+    with pytest.raises(ValueError, match="supports only single-device artifacts"):
         TVMNativeEmbeddingRuntime("fake_model", "fake_lib.so", device="cpu")
 
 

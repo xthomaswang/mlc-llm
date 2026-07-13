@@ -17,7 +17,9 @@ from mlc_llm.serve.entrypoints import (
 )
 from mlc_llm.serve.server import ServerContext
 from mlc_llm.support import logging
-from mlc_llm.support.auto_config import detect_model_task as _detect_model_task
+from mlc_llm.support.auto_config import (
+    detect_model_task_and_config as _detect_model_task_and_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,12 +59,13 @@ def serve(
 ):
     """Serve the model with the specified configuration."""
     # Detect primary model task to decide the serve path
-    model_task = _detect_model_task(model)
+    model_task, model_config_path = _detect_model_task_and_config(model)
     logger.info("Primary model task: %s", model_task)
 
     if model_task == "embedding":
         _serve_embedding(
             model=model,
+            model_path=str(model_config_path.parent),
             device=device,
             model_lib=model_lib,
             host=host,
@@ -111,6 +114,7 @@ def serve(
 
 def _serve_embedding(
     model: str,
+    model_path: str,
     device: str,
     model_lib: Optional[str],
     host: str,
@@ -126,7 +130,7 @@ def _serve_embedding(
         raise ValueError("--model-lib is required when serving an embedding model.")
 
     emb_engine = AsyncEmbeddingEngine(
-        model=model,
+        model=model_path,
         model_lib=model_lib,
         device=device,
     )
@@ -166,7 +170,7 @@ def _serve_chat(
     model_lib: Optional[str],
     mode: Literal["local", "interactive", "server"],
     enable_debug: bool,
-    additional_models: List[Union[str, Tuple[str, str]]],
+    additional_models: list[Union[str, tuple[str, str]]],
     tensor_parallel_shards: Optional[int],
     pipeline_parallel_stages: Optional[int],
     opt: Optional[str],

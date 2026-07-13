@@ -17,9 +17,53 @@ from mlc_llm.serve import engine_utils
 from mlc_llm.support.auto_device import detect_device
 from mlc_llm.tokenizers import Tokenizer
 
+
+def _canonicalize_decoder_inputs(
+    inputs: list[str],
+    tokenizer: Tokenizer,
+    tokenizer_appends_eos: bool,
+    eos_token_id: Optional[int],
+    max_seq_len: int,
+) -> list[list[int]]:
+    """Tokenize decoder inputs while preserving their terminal pooling token."""
+    if max_seq_len <= 0:
+        raise ValueError(f"max_seq_len must be positive, got {max_seq_len}")
+
+    result = []
+    for index, text in enumerate(inputs):
+        tokens = list(tokenizer.encode(text))
+        terminal_token_id = tokens[-1] if tokenizer_appends_eos and tokens else None
+
+        if (
+            not tokenizer_appends_eos
+            and eos_token_id is not None
+            and (not tokens or tokens[-1] != eos_token_id)
+        ):
+            tokens.append(eos_token_id)
+        if eos_token_id is not None and tokens and tokens[-1] == eos_token_id:
+            terminal_token_id = eos_token_id
+
+        if len(tokens) > max_seq_len:
+            tokens = tokens[:max_seq_len]
+            if terminal_token_id is not None:
+                tokens[-1] = terminal_token_id
+
+        if not tokens:
+            raise ValueError(
+                f"Decoder embedding input at index {index} tokenized to 0 tokens; "
+                "at least one token is required "
+                f"(tokenizer_appends_eos={tokenizer_appends_eos}, "
+                f"eos_token_id={eos_token_id})."
+            )
+        result.append(tokens)
+
+    return result
+
+
 # ====================================================================
 # EmbeddingRuntime — abstract interface
 # ====================================================================
+
 
 class EmbeddingRuntime(abc.ABC):
     """Abstract base class for embedding runtime implementations.
@@ -56,7 +100,7 @@ class EmbeddingRuntime(abc.ABC):
         """Model metadata dictionary."""
 
     @abc.abstractmethod
-    def embed(self, inputs: List[str]) -> Tuple[List[List[float]], int]:
+    def embed(self, inputs: list[str]) -> tuple[list[list[float]], int]:
         """Compute embeddings for input strings.
 
         Returns
@@ -112,7 +156,6 @@ class TVMNativeEmbeddingRuntime(EmbeddingRuntime):  # pylint: disable=too-many-i
         vm = relax.VirtualMachine(ex, device=self._device)
         self._mod = vm.module
         self._raw_metadata = json.loads(self._mod["_metadata"]())
-        self._params = engine_utils.load_embedding_params(model, self._device, self._raw_metadata)
 
         # Read embedding metadata — required since phase-1 metadata path
         self._embedding_metadata = engine_utils.get_embedding_metadata(self._raw_metadata)
@@ -136,8 +179,39 @@ class TVMNativeEmbeddingRuntime(EmbeddingRuntime):  # pylint: disable=too-many-i
         self._pooling_strategy = self._embedding_metadata["pooling_strategy"]
         self._normalize = self._embedding_metadata["normalize"]
         # Allow caller to override pooling strategy
-        if pooling_strategy:
+        if pooling_strategy is not None:
             self._pooling_strategy = pooling_strategy
+
+        if self._model_type not in ("encoder", "decoder"):
+            raise ValueError(
+                "Embedding metadata model_type must be 'encoder' or 'decoder'; "
+                f"got {self._model_type!r}."
+            )
+        if self._pooling_strategy not in ("cls", "mean", "last"):
+            raise ValueError(
+                "Embedding pooling_strategy must be 'cls', 'mean', or 'last'; "
+                f"got {self._pooling_strategy!r}."
+            )
+        if self._model_type == "decoder" and self._pooling_strategy != "last":
+            raise ValueError(
+                "Decoder embedding runtime requires pooling_strategy='last'; "
+                f"got {self._pooling_strategy!r}."
+            )
+        if not isinstance(self._normalize, bool):
+            raise ValueError(
+                f"Embedding metadata normalize must be a boolean; got {self._normalize!r}."
+            )
+
+        tensor_parallel_shards = self._raw_metadata.get("tensor_parallel_shards", 1)
+        pipeline_parallel_stages = self._raw_metadata.get("pipeline_parallel_stages", 1)
+        if tensor_parallel_shards != 1 or pipeline_parallel_stages != 1:
+            raise ValueError(
+                "TVM-native embedding runtime currently supports only single-device artifacts; "
+                f"got tensor_parallel_shards={tensor_parallel_shards}, "
+                f"pipeline_parallel_stages={pipeline_parallel_stages}."
+            )
+
+        self._params = engine_utils.load_embedding_params(model, self._device, self._raw_metadata)
 
         # Special token ids (set by _init_encoder; None for decoder models)
         self._cls_token_id: Optional[int] = None
@@ -271,6 +345,8 @@ class TVMNativeEmbeddingRuntime(EmbeddingRuntime):  # pylint: disable=too-many-i
         total_tokens : int
             Total number of tokens processed.
         """
+        if not inputs:
+            return [], 0
         if self._model_type == "encoder":
             return self._embed_encoder(inputs)
         return self._embed_decoder(inputs)
@@ -297,8 +373,10 @@ class TVMNativeEmbeddingRuntime(EmbeddingRuntime):  # pylint: disable=too-many-i
         embeddings: List[List[float]] = []  # noqa: UP006
         total_tokens = 0
         prefill_chunk = self._raw_metadata.get("prefill_chunk_size", 512)
+        if prefill_chunk <= 0:
+            raise ValueError(f"prefill_chunk_size must be positive, got {prefill_chunk}")
 
-        for text in inputs:
+        for index, text in enumerate(inputs):
             tokens = list(self._tokenizer.encode(text))
             # Add [CLS] and [SEP] if needed
             if self._cls_token_id is not None and (
@@ -315,6 +393,11 @@ class TVMNativeEmbeddingRuntime(EmbeddingRuntime):  # pylint: disable=too-many-i
                 tokens = tokens[:prefill_chunk]
                 if self._sep_token_id is not None:
                     tokens[-1] = self._sep_token_id
+            if not tokens:
+                raise ValueError(
+                    f"Encoder embedding input at index {index} tokenized to 0 tokens; "
+                    "at least one token is required."
+                )
 
             seq_len = len(tokens)
             total_tokens += seq_len
@@ -357,26 +440,20 @@ class TVMNativeEmbeddingRuntime(EmbeddingRuntime):  # pylint: disable=too-many-i
         """
         # Read KV cache config from metadata
         prefill_chunk = self._raw_metadata.get("prefill_chunk_size", 2048)
+        if prefill_chunk <= 0:
+            raise ValueError(f"prefill_chunk_size must be positive, got {prefill_chunk}")
         max_seq_len = self._raw_metadata.get("context_window_size", 32768)
         if max_seq_len == -1:
             max_seq_len = self._raw_metadata.get("sliding_window_size", -1)
-        assert max_seq_len > 0, f"max_seq_len must be positive, got {max_seq_len}"
         support_sliding = int(self._raw_metadata.get("sliding_window_size", -1) != -1)
 
-        # Tokenize all inputs. Prefer tokenizer post-processor output. If absent (older models),
-        # fall back to appending eos_token_id when missing.
-        token_lists: List[List[int]] = []  # noqa: UP006
-        for text in inputs:
-            tokens = list(self._tokenizer.encode(text))
-            if (
-                not self._decoder_tokenizer_appends_eos
-                and self._decoder_eos_token_id is not None
-                and (len(tokens) == 0 or tokens[-1] != self._decoder_eos_token_id)
-            ):
-                tokens.append(self._decoder_eos_token_id)
-            if len(tokens) > max_seq_len:
-                tokens = tokens[:max_seq_len]
-            token_lists.append(tokens)
+        token_lists = _canonicalize_decoder_inputs(
+            inputs,
+            self._tokenizer,
+            self._decoder_tokenizer_appends_eos,
+            self._decoder_eos_token_id,
+            max_seq_len,
+        )
 
         total_tokens = sum(len(t) for t in token_lists)
 
@@ -412,7 +489,7 @@ class TVMNativeEmbeddingRuntime(EmbeddingRuntime):  # pylint: disable=too-many-i
         """Partition token lists into sub-batches that fit within prefill_chunk.
 
         Each sub-batch is a tuple of (mode, token_lists, total_token_count).
-        Empty token lists are skipped to avoid invalid batch processing.
+        Empty token lists are rejected so response count and ordering cannot drift.
         """
         sub_batches: List[Tuple[Literal["batch", "sequential"], List[List[int]], int]] = []  # noqa: UP006
         current_batch: List[List[int]] = []  # noqa: UP006
@@ -420,7 +497,7 @@ class TVMNativeEmbeddingRuntime(EmbeddingRuntime):  # pylint: disable=too-many-i
 
         for tokens in token_lists:
             if not tokens:
-                continue
+                raise ValueError("Decoder embedding token lists must not be empty.")
             token_len = len(tokens)
             is_oversized = token_len > prefill_chunk
             if current_batch and (is_oversized or current_tokens + token_len > prefill_chunk):
@@ -509,7 +586,7 @@ class TVMNativeEmbeddingRuntime(EmbeddingRuntime):  # pylint: disable=too-many-i
 
         for tokens in token_lists:
             if len(tokens) == 0:
-                continue
+                raise ValueError("Decoder embedding token lists must not be empty.")
 
             # Create KV cache for this single sequence
             kv_cache = self._create_kv_cache_func(
@@ -624,7 +701,7 @@ class AsyncEmbeddingEngine:
         )
         self._terminated = False
 
-    def embed(self, inputs: List[str]) -> Tuple[List[List[float]], int]:
+    def embed(self, inputs: list[str]) -> tuple[list[list[float]], int]:
         """Compute embeddings for a list of input strings (synchronous).
 
         Parameters
@@ -641,7 +718,7 @@ class AsyncEmbeddingEngine:
         """
         return self._runtime.embed(inputs)
 
-    async def async_embed(self, inputs: List[str]) -> Tuple[List[List[float]], int]:
+    async def async_embed(self, inputs: list[str]) -> tuple[list[list[float]], int]:
         """Compute embeddings asynchronously in a background thread.
 
         This method does not block the asyncio event loop.

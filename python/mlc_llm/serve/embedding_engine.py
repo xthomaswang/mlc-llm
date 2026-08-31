@@ -4,6 +4,8 @@ import asyncio
 import concurrent.futures
 import json
 import os
+import threading
+from collections import deque
 from typing import List, Literal, Optional, Tuple, Union  # noqa: UP035
 
 import numpy as np
@@ -39,6 +41,18 @@ class AsyncEmbeddingEngine:
         Pooling strategy: "cls" (first token), "mean" (masked average),
         or "last" (last token). If None, auto-detected based on model type:
         encoder -> "cls", decoder -> "last".
+
+    enable_dynamic_batching : bool
+        When True (default), concurrent ``async_embed`` calls are coalesced
+        into fused GPU forwards: while the worker thread is busy, newly
+        arriving requests queue up and the next forward takes as many of them
+        as fit within ``max_batch_tokens``. A lone request is processed
+        immediately, so idle-time latency is unchanged.
+
+    max_batch_tokens : Optional[int]
+        Token budget of one fused forward. Defaults to the model's
+        ``prefill_chunk_size`` so a fused batch stays within a single
+        internal sub-batch.
     """
 
     def __init__(
@@ -48,6 +62,8 @@ class AsyncEmbeddingEngine:
         device: Union[str, Device] = "auto",
         *,
         pooling_strategy: Optional[str] = None,
+        enable_dynamic_batching: bool = True,
+        max_batch_tokens: Optional[int] = None,
     ) -> None:
         # Reuse existing utility: device detection
         self.device = detect_device(device) if isinstance(device, str) else device
@@ -86,6 +102,14 @@ class AsyncEmbeddingEngine:
             max_workers=1, thread_name_prefix="embedding"
         )
         self._terminated = False
+
+        # Cross-request dynamic batching state. Requests queue in `_pending`
+        # and the single worker thread drains them in fused forwards.
+        self._dynamic_batching = enable_dynamic_batching
+        self._max_batch_tokens = max_batch_tokens or self._metadata.get("prefill_chunk_size", 512)
+        self._pending: deque = deque()
+        self._batch_lock = threading.Lock()
+        self._drain_scheduled = False
 
     def _init_encoder(self, model: str) -> None:
         """Initialize encoder (BERT-style) model functions and special tokens."""
@@ -198,8 +222,69 @@ class AsyncEmbeddingEngine:
         total_tokens : int
             Total number of tokens processed.
         """
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, self.embed, inputs)
+        if not self._dynamic_batching:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(self._executor, self.embed, inputs)
+
+        result: concurrent.futures.Future = concurrent.futures.Future()
+        with self._batch_lock:
+            self._pending.append((list(inputs), result))
+            if not self._drain_scheduled:
+                self._drain_scheduled = True
+                self._executor.submit(self._drain_pending)
+        return await asyncio.wrap_future(result)
+
+    def _drain_pending(self) -> None:
+        """Drain queued requests in fused GPU forwards (runs on the worker thread).
+
+        Each round pops as many pending requests as fit within the
+        ``max_batch_tokens`` budget, embeds them in one forward, and scatters
+        the results back to the per-request futures. Requests that arrive
+        while a forward is running are picked up by the next round.
+        """
+        while True:
+            with self._batch_lock:
+                if not self._pending or self._terminated:
+                    self._drain_scheduled = False
+                    return
+                requests = list(self._pending)
+                self._pending.clear()
+
+            # Size the fused batch outside the lock (tokenization is CPU-only).
+            taken: List[Tuple[List[str], concurrent.futures.Future, int]] = []  # noqa: UP006
+            fused: List[str] = []  # noqa: UP006
+            total_estimate = 0
+            idx = 0
+            while idx < len(requests):
+                inputs, fut = requests[idx]
+                num_tokens = sum(len(self.tokenizer.encode(text)) for text in inputs)
+                if taken and total_estimate + num_tokens > self._max_batch_tokens:
+                    break
+                taken.append((inputs, fut, num_tokens))
+                fused.extend(inputs)
+                total_estimate += num_tokens
+                idx += 1
+            if idx < len(requests):
+                with self._batch_lock:
+                    self._pending.extendleft(reversed(requests[idx:]))
+
+            try:
+                embeddings, total_tokens = self.embed(fused) if fused else ([], 0)
+            except Exception as exc:  # pylint: disable=broad-except
+                for _, fut, _ in taken:
+                    if not fut.done():
+                        fut.set_exception(exc)
+                continue
+
+            offset = 0
+            for inputs, fut, num_tokens in taken:
+                share = embeddings[offset : offset + len(inputs)]
+                offset += len(inputs)
+                # A lone request reports the engine-computed token count; in a
+                # fused batch each request reports its own tokenizer count.
+                usage = total_tokens if len(taken) == 1 else num_tokens
+                if not fut.done():
+                    fut.set_result((share, usage))
 
     def _embed_encoder(
         self,
@@ -340,7 +425,9 @@ class AsyncEmbeddingEngine:
         Each sub-batch is a tuple of (mode, token_lists, total_token_count).
         Empty token lists are skipped to avoid invalid batch processing.
         """
-        sub_batches: List[Tuple[Literal["batch", "sequential"], List[List[int]], int]] = []  # noqa: UP006
+        sub_batches: List[Tuple[Literal["batch", "sequential"], List[List[int]], int]] = (
+            []
+        )  # noqa: UP006
         current_batch: List[List[int]] = []  # noqa: UP006
         current_tokens = 0
 
@@ -484,6 +571,12 @@ class AsyncEmbeddingEngine:
         if getattr(self, "_terminated", True):
             return
         self._terminated = True
+        with self._batch_lock:
+            pending = list(self._pending)
+            self._pending.clear()
+        for _, fut in pending:
+            if not fut.done():
+                fut.set_exception(RuntimeError("Embedding engine terminated."))
         self._executor.shutdown(wait=False)
 
     def __del__(self):

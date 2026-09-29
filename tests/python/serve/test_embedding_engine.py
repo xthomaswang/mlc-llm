@@ -16,6 +16,7 @@ Environment variables:
 
 import asyncio
 import os
+import threading
 
 import numpy as np
 import pytest
@@ -81,6 +82,7 @@ def cosine_similarity(a, b):
 def test_engine_model_type(embedding_engine):
     """Engine reports a valid model type."""
     assert embedding_engine.model_type in ("encoder", "decoder")
+    assert embedding_engine._dynamic_batching == (embedding_engine.model_type == "decoder")
 
 
 def test_engine_pooling_strategy(embedding_engine):
@@ -229,9 +231,15 @@ def test_long_text_decoder_chunked_prefill(embedding_engine):
     ~5000 tokens processed in 3 chunks. Result is unit-norm embedding."""
     if embedding_engine.model_type != "decoder":
         pytest.skip("Chunked prefill is decoder-only")
-    long_text = "word " * 5000
+    prefill_chunk = embedding_engine._metadata.get("prefill_chunk_size", 2048)
+    context_window = embedding_engine._metadata.get("context_window_size", 32768)
+    if context_window == -1:
+        context_window = embedding_engine._metadata.get("sliding_window_size", -1)
+    if context_window <= prefill_chunk:
+        pytest.skip("Compiled context window cannot exceed one prefill chunk")
+    long_text = "word " * (prefill_chunk + 100)
     embeddings, tokens = embedding_engine.embed([long_text])
-    assert tokens > 2048, f"Expected >2048 tokens to trigger chunking, got {tokens}"
+    assert tokens > prefill_chunk, f"Expected >{prefill_chunk} tokens for chunking, got {tokens}"
     norm = float(np.linalg.norm(embeddings[0]))
     assert abs(norm - 1.0) < 1e-3
 
@@ -303,7 +311,7 @@ def test_long_text_encoder_truncation(embedding_engine):
 
 def test_long_vs_short_semantic_quality(embedding_engine):
     """Long text should still capture semantic meaning correctly.
-    Decoder: chunked prefill preserves full context.
+    Decoder: chunked prefill or truncation at the compiled context limit.
     Encoder: truncation keeps most relevant prefix."""
     short_ml = "Machine learning enables systems to learn from data"
     long_ml = (
@@ -329,6 +337,73 @@ def test_unicode_text(embedding_engine):
     assert len(embeddings) == 3
     for emb in embeddings:
         assert abs(float(np.linalg.norm(emb)) - 1.0) < 1e-4
+
+
+def test_empty_input_list(embedding_engine):
+    """An empty list does not create a zero-sequence KV cache."""
+    assert embedding_engine.embed([]) == ([], 0)
+
+
+def test_decoder_context_truncation(embedding_engine):
+    """Truncation returns a valid vector and usage reflects the compiled context limit."""
+    if embedding_engine.model_type != "decoder":
+        pytest.skip("Decoder-only context limit")
+    limit = embedding_engine._metadata.get("context_window_size", 32768)
+    if limit == -1:
+        limit = embedding_engine._metadata["sliding_window_size"]
+    vectors, tokens = embedding_engine.embed(["word " * (limit + 100)])
+    assert tokens == limit
+    assert len(vectors) == 1
+    assert abs(float(np.linalg.norm(vectors[0])) - 1.0) < 1e-4
+
+
+def test_concurrent_usage_order_and_vectors(embedding_engine):
+    """Fused requests preserve per-request usage and input ordering."""
+    inputs = [["Hello world", ""], ["machine learning " * 20], ["A short sentence."]]
+    singles = [embedding_engine.embed(texts) for texts in inputs]
+
+    async def run():
+        release = threading.Event()
+        embedding_engine._executor.submit(release.wait, 10)
+        try:
+            tasks = [asyncio.create_task(embedding_engine.async_embed(texts)) for texts in inputs]
+            await asyncio.sleep(0)
+        finally:
+            release.set()
+        return await asyncio.wait_for(asyncio.gather(*tasks), 60)
+
+    results = asyncio.run(run())
+    for (expected, expected_tokens), (actual, actual_tokens) in zip(singles, results):
+        assert actual_tokens == expected_tokens
+        assert len(actual) == len(expected)
+        for a, b in zip(expected, actual):
+            assert cosine_similarity(a, b) > 0.999
+
+
+@pytest.mark.parametrize("batch_size", [7, 32])
+def test_decoder_page_fragmentation(embedding_engine, batch_size):
+    """Per-sequence page rounding must not exhaust a token-budgeted batch."""
+    if embedding_engine.model_type != "decoder":
+        pytest.skip("Paged KV cache is decoder-only")
+    text = " ".join(["Retrieval-augmented generation pipelines depend on embedding quality."] * 12)
+    vectors, tokens = embedding_engine.embed([text] * batch_size)
+    reference, reference_tokens = embedding_engine.embed([text])
+    assert len(vectors) == batch_size
+    assert tokens == reference_tokens * batch_size
+    assert min(cosine_similarity(v, reference[0]) for v in vectors) > 0.999
+
+
+def test_async_tokenizer_error_recovery(embedding_engine):
+    """An unpaired surrogate must fail without poisoning later requests."""
+
+    async def run():
+        with pytest.raises(UnicodeEncodeError):
+            await asyncio.wait_for(embedding_engine.async_embed(["\ud800"]), 10)
+        vectors, tokens = await asyncio.wait_for(embedding_engine.async_embed(["valid"]), 30)
+        assert len(vectors) == 1
+        assert tokens > 0
+
+    asyncio.run(run())
 
 
 # ===================================================================

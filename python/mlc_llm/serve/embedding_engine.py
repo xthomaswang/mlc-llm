@@ -6,6 +6,7 @@ import json
 import os
 import threading
 from collections import deque
+from dataclasses import dataclass
 from typing import List, Literal, Optional, Tuple, Union  # noqa: UP035
 
 import numpy as np
@@ -17,6 +18,13 @@ from tvm_ffi import Shape
 from mlc_llm.serve import engine_utils
 from mlc_llm.support.auto_device import detect_device
 from mlc_llm.tokenizers import Tokenizer
+
+
+@dataclass
+class _EmbeddingRequest:
+    inputs: List[str]  # noqa: UP006
+    future: concurrent.futures.Future
+    token_lists: Optional[List[List[int]]] = None  # noqa: UP006
 
 
 class AsyncEmbeddingEngine:
@@ -43,16 +51,18 @@ class AsyncEmbeddingEngine:
         encoder -> "cls", decoder -> "last".
 
     enable_dynamic_batching : bool
-        When True (default), concurrent ``async_embed`` calls are coalesced
+        When True (default), concurrent decoder ``async_embed`` calls are coalesced
         into fused GPU forwards: while the worker thread is busy, newly
         arriving requests queue up and the next forward takes as many of them
         as fit within ``max_batch_tokens``. A lone request is processed
-        immediately, so idle-time latency is unchanged.
+        immediately, so idle-time latency is unchanged. Encoder requests are
+        not coalesced because the encoder currently processes inputs individually.
 
     max_batch_tokens : Optional[int]
         Token budget of one fused forward. Defaults to the model's
         ``prefill_chunk_size`` so a fused batch stays within a single
-        internal sub-batch.
+        internal sub-batch. Must be positive. An individual request exceeding
+        this budget is processed on its own using internal sub-batching.
     """
 
     def __init__(
@@ -65,6 +75,12 @@ class AsyncEmbeddingEngine:
         enable_dynamic_batching: bool = True,
         max_batch_tokens: Optional[int] = None,
     ) -> None:
+        if max_batch_tokens is not None and (
+            not isinstance(max_batch_tokens, int)
+            or isinstance(max_batch_tokens, bool)
+            or max_batch_tokens <= 0
+        ):
+            raise ValueError("max_batch_tokens must be a positive integer")
         # Reuse existing utility: device detection
         self.device = detect_device(device) if isinstance(device, str) else device
         # Reuse existing utility: tokenizer
@@ -101,15 +117,19 @@ class AsyncEmbeddingEngine:
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="embedding"
         )
-        self._terminated = False
-
         # Cross-request dynamic batching state. Requests queue in `_pending`
         # and the single worker thread drains them in fused forwards.
-        self._dynamic_batching = enable_dynamic_batching
-        self._max_batch_tokens = max_batch_tokens or self._metadata.get("prefill_chunk_size", 512)
+        self._dynamic_batching = enable_dynamic_batching and self.model_type == "decoder"
+        self._max_batch_tokens = (
+            max_batch_tokens
+            if max_batch_tokens is not None
+            else self._metadata.get("prefill_chunk_size", 512)
+        )
         self._pending: deque = deque()
+        self._outstanding: set = set()
         self._batch_lock = threading.Lock()
         self._drain_scheduled = False
+        self._terminated = False
 
     def _init_encoder(self, model: str) -> None:
         """Initialize encoder (BERT-style) model functions and special tokens."""
@@ -201,9 +221,67 @@ class AsyncEmbeddingEngine:
         total_tokens : int
             Total number of tokens processed.
         """
+        if self._terminated:
+            raise RuntimeError("Embedding engine terminated.")
+        return self._embed_token_lists(self._tokenize_inputs(inputs))
+
+    def _tokenize_inputs(self, inputs: List[str]) -> List[List[int]]:  # noqa: UP006
+        """Prepare tokens once, sharing special-token and truncation rules with batching."""
         if self.model_type == "encoder":
-            return self._embed_encoder(inputs)
-        return self._embed_decoder(inputs)
+            limit = self._metadata.get("prefill_chunk_size", 512)
+        else:
+            limit = self._metadata.get("context_window_size", 32768)
+            if limit == -1:
+                limit = self._metadata.get("sliding_window_size", -1)
+        assert limit > 0, f"Token limit must be positive, got {limit}"
+
+        token_lists = []
+        for text in inputs:
+            tokens = list(self.tokenizer.encode(text))
+            if self.model_type == "encoder":
+                if self._cls_token_id is not None and (
+                    not tokens or tokens[0] != self._cls_token_id
+                ):
+                    tokens.insert(0, self._cls_token_id)
+                if self._sep_token_id is not None and (
+                    not tokens or tokens[-1] != self._sep_token_id
+                ):
+                    tokens.append(self._sep_token_id)
+                if len(tokens) > limit:
+                    tokens = tokens[:limit]
+                    if self._sep_token_id is not None:
+                        tokens[-1] = self._sep_token_id
+            else:
+                if (
+                    not self._decoder_tokenizer_appends_eos
+                    and self._decoder_eos_token_id is not None
+                    and (not tokens or tokens[-1] != self._decoder_eos_token_id)
+                ):
+                    tokens.append(self._decoder_eos_token_id)
+                if len(tokens) > limit:
+                    # Last-token pooling must still see the terminal token after truncation.
+                    has_terminal_token = self._decoder_tokenizer_appends_eos or (
+                        self._decoder_eos_token_id is not None
+                        and tokens[-1] == self._decoder_eos_token_id
+                    )
+                    terminal_token = tokens[-1]
+                    tokens = tokens[:limit]
+                    if has_terminal_token:
+                        tokens[-1] = terminal_token
+            if not tokens:
+                raise ValueError("Embedding input must produce at least one token.")
+            token_lists.append(tokens)
+        return token_lists
+
+    def _embed_token_lists(
+        self,
+        token_lists: List[List[int]],  # noqa: UP006
+    ) -> Tuple[List[List[float]], int]:  # noqa: UP006
+        if not token_lists:
+            return [], 0
+        if self.model_type == "encoder":
+            return self._embed_encoder(token_lists)
+        return self._embed_decoder(token_lists)
 
     async def async_embed(self, inputs: List[str]) -> Tuple[List[List[float]], int]:  # noqa: UP006
         """Compute embeddings asynchronously in a background thread.
@@ -222,17 +300,31 @@ class AsyncEmbeddingEngine:
         total_tokens : int
             Total number of tokens processed.
         """
-        if not self._dynamic_batching:
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(self._executor, self.embed, inputs)
-
         result: concurrent.futures.Future = concurrent.futures.Future()
         with self._batch_lock:
-            self._pending.append((list(inputs), result))
+            if self._terminated:
+                raise RuntimeError("Embedding engine terminated.")
+            self._pending.append(_EmbeddingRequest(list(inputs), result))
+            self._outstanding.add(result)
             if not self._drain_scheduled:
                 self._drain_scheduled = True
                 self._executor.submit(self._drain_pending)
         return await asyncio.wrap_future(result)
+
+    def _finish_request(self, future, *, result=None, error=None) -> None:
+        with self._batch_lock:
+            if future not in self._outstanding:
+                return
+            self._outstanding.remove(future)
+            try:
+                if error is not None:
+                    future.set_exception(error)
+                else:
+                    future.set_result(result)
+            except concurrent.futures.InvalidStateError:
+                # asyncio cancellation can race with completion on the worker.
+                if not future.cancelled():
+                    raise
 
     def _drain_pending(self) -> None:
         """Drain queued requests in fused GPU forwards (runs on the worker thread).
@@ -247,48 +339,61 @@ class AsyncEmbeddingEngine:
                 if not self._pending or self._terminated:
                     self._drain_scheduled = False
                     return
-                requests = list(self._pending)
-                self._pending.clear()
+                count = len(self._pending) if self._dynamic_batching else 1
 
-            # Size the fused batch outside the lock (tokenization is CPU-only).
-            taken: List[Tuple[List[str], concurrent.futures.Future, int]] = []  # noqa: UP006
-            fused: List[str] = []  # noqa: UP006
-            total_estimate = 0
-            idx = 0
-            while idx < len(requests):
-                inputs, fut = requests[idx]
-                num_tokens = sum(len(self.tokenizer.encode(text)) for text in inputs)
-                if taken and total_estimate + num_tokens > self._max_batch_tokens:
-                    break
-                taken.append((inputs, fut, num_tokens))
-                fused.extend(inputs)
-                total_estimate += num_tokens
-                idx += 1
-            if idx < len(requests):
+            taken = []
+            fused = []
+            total_tokens = 0
+            for _ in range(count):
                 with self._batch_lock:
-                    self._pending.extendleft(reversed(requests[idx:]))
+                    if self._terminated:
+                        self._drain_scheduled = False
+                        return
+                    request = self._pending.popleft()
+                if request.future.cancelled():
+                    self._finish_request(request.future)
+                    continue
+                try:
+                    if request.token_lists is None:
+                        request.token_lists = self._tokenize_inputs(request.inputs)
+                except Exception as exc:  # pylint: disable=broad-except
+                    self._finish_request(request.future, error=exc)
+                    continue
+                num_tokens = sum(len(tokens) for tokens in request.token_lists)
+                if taken and total_tokens + num_tokens > self._max_batch_tokens:
+                    with self._batch_lock:
+                        if not self._terminated:
+                            self._pending.appendleft(request)
+                    break
+                taken.append((request, num_tokens))
+                fused.extend(request.token_lists)
+                total_tokens += num_tokens
+
+            if not taken:
+                continue
+            with self._batch_lock:
+                if self._terminated:
+                    self._drain_scheduled = False
+                    return
 
             try:
-                embeddings, total_tokens = self.embed(fused) if fused else ([], 0)
+                embeddings, _ = self._embed_token_lists(fused)
+                if len(embeddings) != len(fused):
+                    raise RuntimeError("Embedding output count does not match input count.")
             except Exception as exc:  # pylint: disable=broad-except
-                for _, fut, _ in taken:
-                    if not fut.done():
-                        fut.set_exception(exc)
+                for request, _ in taken:
+                    self._finish_request(request.future, error=exc)
                 continue
 
             offset = 0
-            for inputs, fut, num_tokens in taken:
-                share = embeddings[offset : offset + len(inputs)]
-                offset += len(inputs)
-                # A lone request reports the engine-computed token count; in a
-                # fused batch each request reports its own tokenizer count.
-                usage = total_tokens if len(taken) == 1 else num_tokens
-                if not fut.done():
-                    fut.set_result((share, usage))
+            for request, num_tokens in taken:
+                share = embeddings[offset : offset + len(request.inputs)]
+                offset += len(request.inputs)
+                self._finish_request(request.future, result=(share, num_tokens))
 
     def _embed_encoder(
         self,
-        inputs: List[str],  # noqa: UP006
+        token_lists: List[List[int]],  # noqa: UP006
     ) -> Tuple[List[List[float]], int]:  # noqa: UP006
         """Encoder model embedding (BERT-style).
 
@@ -307,26 +412,7 @@ class AsyncEmbeddingEngine:
         """  # noqa: RUF002
         embeddings: List[List[float]] = []  # noqa: UP006
         total_tokens = 0
-        prefill_chunk = self._metadata.get("prefill_chunk_size", 512)
-
-        for text in inputs:
-            tokens = list(self.tokenizer.encode(text))
-            # Add [CLS] and [SEP] if needed
-            if self._cls_token_id is not None and (
-                len(tokens) == 0 or tokens[0] != self._cls_token_id
-            ):
-                tokens = [self._cls_token_id, *tokens]
-            if self._sep_token_id is not None and (
-                len(tokens) == 0 or tokens[-1] != self._sep_token_id
-            ):
-                tokens = [*tokens, self._sep_token_id]
-
-            # Truncate to compiled buffer limit (keep [CLS] at start, [SEP] at end)
-            if len(tokens) > prefill_chunk:
-                tokens = tokens[:prefill_chunk]
-                if self._sep_token_id is not None:
-                    tokens[-1] = self._sep_token_id
-
+        for tokens in token_lists:
             seq_len = len(tokens)
             total_tokens += seq_len
 
@@ -359,7 +445,10 @@ class AsyncEmbeddingEngine:
 
         return embeddings, total_tokens
 
-    def _embed_decoder(self, inputs: List[str]) -> Tuple[List[List[float]], int]:  # noqa: UP006
+    def _embed_decoder(
+        self,
+        token_lists: List[List[int]],  # noqa: UP006
+    ) -> Tuple[List[List[float]], int]:  # noqa: UP006
         """Decoder model embedding with batch prefill optimization.
 
         When total tokens fit within prefill_chunk_size, all inputs are processed
@@ -373,21 +462,6 @@ class AsyncEmbeddingEngine:
             max_seq_len = self._metadata.get("sliding_window_size", -1)
         assert max_seq_len > 0, f"max_seq_len must be positive, got {max_seq_len}"
         support_sliding = int(self._metadata.get("sliding_window_size", -1) != -1)
-
-        # Tokenize all inputs. Prefer tokenizer post-processor output. If absent (older models),
-        # fall back to appending eos_token_id when missing.
-        token_lists: List[List[int]] = []  # noqa: UP006
-        for text in inputs:
-            tokens = list(self.tokenizer.encode(text))
-            if (
-                not self._decoder_tokenizer_appends_eos
-                and self._decoder_eos_token_id is not None
-                and (len(tokens) == 0 or tokens[-1] != self._decoder_eos_token_id)
-            ):
-                tokens.append(self._decoder_eos_token_id)
-            if len(tokens) > max_seq_len:
-                tokens = tokens[:max_seq_len]
-            token_lists.append(tokens)
 
         total_tokens = sum(len(t) for t in token_lists)
 
@@ -425,9 +499,7 @@ class AsyncEmbeddingEngine:
         Each sub-batch is a tuple of (mode, token_lists, total_token_count).
         Empty token lists are skipped to avoid invalid batch processing.
         """
-        sub_batches: List[Tuple[Literal["batch", "sequential"], List[List[int]], int]] = (
-            []
-        )  # noqa: UP006
+        sub_batches: List[Tuple[Literal["batch", "sequential"], List[List[int]], int]] = []  # noqa: UP006
         current_batch: List[List[int]] = []  # noqa: UP006
         current_tokens = 0
 
@@ -460,12 +532,17 @@ class AsyncEmbeddingEngine:
         """Batch prefill: process all inputs in a single forward pass."""
         batch_size = len(token_lists)
 
-        # Create KV cache for the entire batch
+        # Cache capacity is shared across sequences. Each sequence owns whole
+        # pages, so summing unrounded token lengths can under-allocate the cache.
+        page_size = 16
+        paged_tokens = sum(
+            ((len(tokens) + page_size - 1) // page_size) * page_size for tokens in token_lists
+        )
         kv_cache = self._create_kv_cache_func(
             Shape([batch_size]),
-            Shape([max_seq_len]),
+            Shape([max(max_seq_len, paged_tokens)]),
             Shape([prefill_chunk]),
-            Shape([16]),
+            Shape([page_size]),
             Shape([support_sliding]),
         )
 
@@ -570,14 +647,15 @@ class AsyncEmbeddingEngine:
         """Terminate the engine and clean up the thread pool."""
         if getattr(self, "_terminated", True):
             return
-        self._terminated = True
         with self._batch_lock:
-            pending = list(self._pending)
+            if self._terminated:
+                return
+            self._terminated = True
+            outstanding = list(self._outstanding)
             self._pending.clear()
-        for _, fut in pending:
-            if not fut.done():
-                fut.set_exception(RuntimeError("Embedding engine terminated."))
-        self._executor.shutdown(wait=False)
+        for future in outstanding:
+            self._finish_request(future, error=RuntimeError("Embedding engine terminated."))
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     def __del__(self):
         self.terminate()

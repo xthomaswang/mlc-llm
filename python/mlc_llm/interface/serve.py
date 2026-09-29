@@ -56,6 +56,8 @@ def serve(
     allow_methods: Any,
     allow_headers: Any,
     api_key: Optional[str] = None,
+    embedding_dynamic_batching: bool = True,
+    embedding_max_batch_tokens: Optional[int] = None,
 ):
     """Serve the model with the specified configuration."""
     # An embedding primary model is served in embedding-only mode; all other
@@ -79,6 +81,8 @@ def serve(
             allow_methods=allow_methods,
             allow_headers=allow_headers,
             api_key=api_key,
+            enable_dynamic_batching=embedding_dynamic_batching,
+            max_batch_tokens=embedding_max_batch_tokens,
         )
         return
 
@@ -127,6 +131,8 @@ def serve(
             model=embedding_model,
             model_lib=embedding_model_lib,
             device=device,
+            enable_dynamic_batching=embedding_dynamic_batching,
+            max_batch_tokens=embedding_max_batch_tokens,
         )
         logger.info("Embedding model %s loaded successfully.", embedding_model)
 
@@ -174,6 +180,8 @@ def _serve_embedding(  # pylint: disable=too-many-arguments
     allow_methods: Any,
     allow_headers: Any,
     api_key: Optional[str],
+    enable_dynamic_batching: bool = True,
+    max_batch_tokens: Optional[int] = None,
 ):
     """Serve an embedding model as the primary (and only) model.
 
@@ -188,6 +196,8 @@ def _serve_embedding(  # pylint: disable=too-many-arguments
         model=model_path,
         model_lib=model_lib,
         device=device,
+        enable_dynamic_batching=enable_dynamic_batching,
+        max_batch_tokens=max_batch_tokens,
     )
     logger.info("Embedding model %s loaded successfully.", model)
 

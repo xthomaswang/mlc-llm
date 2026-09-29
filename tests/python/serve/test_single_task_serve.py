@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from mlc_llm.cli import serve as serve_cli
 from mlc_llm.interface import serve as serve_interface
 from mlc_llm.serve.entrypoints import openai_entrypoints
 from mlc_llm.support.auto_config import detect_model_task, detect_model_task_and_config
@@ -145,6 +146,52 @@ def test_serve_dispatches_chat_model(tmp_path, monkeypatch):
     )
     with pytest.raises(_ChatPathTaken):
         serve_interface.serve(**_serve_kwargs(str(model_dir)))
+
+
+@pytest.mark.parametrize("batching", ["enable", "disable"])
+def test_cli_embedding_batching_options(monkeypatch, batching):
+    called = {}
+    monkeypatch.setattr(serve_cli, "serve", lambda **kwargs: called.update(kwargs))
+    serve_cli.main(
+        ["model", "--embedding-batching", batching, "--embedding-max-batch-tokens", "256"]
+    )
+    assert called["embedding_dynamic_batching"] == (batching == "enable")
+    assert called["embedding_max_batch_tokens"] == 256
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_cli_rejects_invalid_embedding_budget(monkeypatch, value):
+    monkeypatch.setattr(serve_cli, "serve", lambda **_: pytest.fail("must reject before serving"))
+    with pytest.raises(SystemExit):
+        serve_cli.main(["model", "--embedding-max-batch-tokens", value])
+
+
+@pytest.mark.parametrize("sidecar", [False, True])
+def test_serve_forwards_embedding_batching_options(tmp_path, monkeypatch, sidecar):
+    model_dir = _write_model_dir(tmp_path, {"model_task": "chat" if sidecar else "embedding"})
+    created = []
+
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+        def terminate(self):
+            pass
+
+    monkeypatch.setattr(serve_interface, "AsyncEmbeddingEngine", FakeEngine)
+    monkeypatch.setattr(serve_interface.engine, "AsyncMLCEngine", FakeEngine)
+    monkeypatch.setattr(serve_interface.uvicorn, "run", lambda *_, **__: None)
+    serve_interface.serve(
+        **_serve_kwargs(
+            str(model_dir),
+            embedding_model="sidecar" if sidecar else None,
+            embedding_model_lib="sidecar.so" if sidecar else None,
+            embedding_dynamic_batching=False,
+            embedding_max_batch_tokens=256,
+        )
+    )
+    assert created[-1]["enable_dynamic_batching"] is False
+    assert created[-1]["max_batch_tokens"] == 256
 
 
 if __name__ == "__main__":

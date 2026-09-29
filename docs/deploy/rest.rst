@@ -83,6 +83,20 @@ In this mode the server exposes only ``GET /v1/models`` and ``POST /v1/embedding
        -H "Content-Type: application/json" \
        -d '{"model": "./dist/Qwen3-Embedding-0.6B-q0f32-MLC", "input": ["hello", "world"]}'
 
+Concurrent decoder embedding requests are batched by default, without waiting to fill
+a batch when the engine is idle. The token budget includes special tokens and truncation;
+an individual request above the budget runs on its own using internal sub-batching.
+Encoder requests are not coalesced because encoder inference currently processes each
+input individually. To set a token budget or disable cross-request batching:
+
+.. code:: bash
+
+   mlc_llm serve ./dist/Qwen3-Embedding-0.6B-q0f32-MLC \
+       --model-lib ./dist/libs/Qwen3-Embedding-0.6B-q0f32-metal.dylib \
+       --embedding-max-batch-tokens 512
+
+   # Add --embedding-batching disable to process requests separately.
+
 Chat-engine options (``--mode``, ``--additional-models``, speculative decoding, etc.) do not
 apply to embedding models and are ignored. The previous way of serving embeddings alongside a
 chat model (``--embedding-model``/``--embedding-model-lib``) still works but is deprecated in

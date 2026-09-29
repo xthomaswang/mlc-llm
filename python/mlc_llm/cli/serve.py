@@ -154,6 +154,20 @@ def main(argv):
         "Prefer serving the embedding model directly with --model-lib",
     )
     parser.add_argument(
+        "--embedding-batching",
+        choices=["enable", "disable"],
+        default="enable",
+        help="Coalesce concurrent decoder embedding requests (default: %(default)s). "
+        "Encoder requests are never coalesced.",
+    )
+    parser.add_argument(
+        "--embedding-max-batch-tokens",
+        type=int,
+        default=None,
+        help="Positive token budget for coalesced embedding requests. "
+        "Defaults to the compiled prefill chunk size.",
+    )
+    parser.add_argument(
         "--speculative-mode",
         type=str,
         choices=["disable", "small_draft", "eagle", "medusa"],
@@ -219,6 +233,8 @@ def main(argv):
         help="API key for authentication. If not provided, authentication is disabled.",
     )
     parsed = parser.parse_args(argv)
+    if parsed.embedding_max_batch_tokens is not None and parsed.embedding_max_batch_tokens <= 0:
+        parser.error("--embedding-max-batch-tokens must be positive")
 
     additional_models = []
     if parsed.additional_models is not None:
@@ -238,6 +254,8 @@ def main(argv):
         additional_models=additional_models,
         embedding_model=parsed.embedding_model,
         embedding_model_lib=parsed.embedding_model_lib,
+        embedding_dynamic_batching=parsed.embedding_batching == "enable",
+        embedding_max_batch_tokens=parsed.embedding_max_batch_tokens,
         tensor_parallel_shards=parsed.overrides.tensor_parallel_shards,
         pipeline_parallel_stages=parsed.overrides.pipeline_parallel_stages,
         opt=parsed.overrides.opt,
